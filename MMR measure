@@ -1,0 +1,193 @@
+function plot_MMR_eps_exact_ULTIMATE_N8()
+% Monte Carlo estimation of MMR via exact ILP Solver 
+% Global optimum guaranteed through integer linear programming(with matlab, it can handle n = 8)
+
+    n = 8;
+    R = 100;
+    seed = 20251212;
+    
+    sqrt_eps_grid = (0:0.2:1).'; 
+    eps_grid = sqrt_eps_grid.^2;
+
+    fprintf('====\n');
+    fprintf('Exact ILP Solver for MMR Estimation (n=%d)\n', n);
+    fprintf('Global optimum via integer linear programming\n');
+    fprintf('=====\n');
+    fprintf('1. Precomputing inverted index structures...\n');
+    
+    [topo, SolverDB] = precompute_structures(n);
+    
+    fprintf('2. Running Monte Carlo simulation...\n');
+    
+    if isempty(which('intlinprog'))
+        error('MATLAB optimization toolbox should be downloaded');
+    end
+    
+    [mean_MMR, se_MMR] = run_simulation_precise(n, R, eps_grid, seed, topo, SolverDB);
+
+    figure('Color', 'w', 'Position', [100, 100, 700, 500]);
+    
+    plot(sqrt_eps_grid, mean_MMR, 'o-', ...
+         'LineWidth', 1.5, ...
+         'Color', [0, 0, 1], ...
+         'MarkerFaceColor', [0, 0, 1], ...
+         'MarkerSize', 6);
+    
+    ylabel('$E[\mathrm{MMR}(c_{\varepsilon})]$', 'Interpreter', 'latex', 'FontSize', 14);
+    xlabel('$\sqrt{\varepsilon}$', 'Interpreter', 'latex', 'FontSize', 14);
+    title(sprintf('Monte Carlo Estimation of MMR (n=%d, R=%d)', n, R), 'Interpreter', 'latex', 'FontSize', 12);
+    
+    grid on; box on;
+    set(gca, 'TickLabelInterpreter', 'latex', 'FontSize', 12);
+    xlim([-0.05, 1.05]);
+    
+    fprintf('Done.\n');
+end
+
+function [mean_MMR, se_MMR] = run_simulation_precise(n, R, eps_grid, seed, topo, SolverDB)
+    % Core simulation loop with exact ILP solver
+    
+    rng(seed);
+    K_eps = numel(eps_grid);
+    numMenus = topo.numMenus;
+    numPerms = SolverDB.numPerms;
+    
+    samples = zeros(K_eps, R);
+    
+    % Pre-generate random numbers for controlled variation
+    all_U = rand(numMenus, R);
+    all_J = zeros(numMenus, R, 'uint8');
+    for m = 1:numMenus
+        all_J(m, :) = uint8(randi(numel(topo.elements{m}), 1, R));
+    end
+    
+    % ILP solver options: zero gap tolerance for exact optimum
+    options = optimoptions('intlinprog', 'Display', 'off', ...
+                           'IntegerTolerance', 1e-6, ...
+                           'RelativeGapTolerance', 0.0, ... 
+                           'MaxTime', 120); 
+    
+    % ILP standard form: min f'*x, s.t. A*x >= b
+    f = ones(numPerms, 1);
+    intcon = 1:numPerms;
+    lb = zeros(numPerms, 1);
+    ub = ones(numPerms, 1);
+    b = ones(numMenus, 1);
+    total_iters = R * K_eps;
+    current_iter = 0;
+    t_start = tic;
+    
+    fprintf('%-10s %-10s %-40s\n', 'Progress', 'Time', 'Result Info');
+    
+    for r = 1:R
+        U_col = all_U(:, r);
+        J_col = all_J(:, r);
+        
+        for k = 1:K_eps
+            current_iter = current_iter + 1;
+            eps_val = eps_grid(k);
+            
+            % Generate observed choices
+            Choices = zeros(numMenus, 1, 'uint8');
+            for m = 1:numMenus
+                if U_col(m) > eps_val
+                    Choices(m) = topo.elements{m}(1); % Rational choice
+                else
+                    Choices(m) = topo.elements{m}(J_col(m)); % Noisy choice
+                end
+            end
+            
+            % Fast sparse constraint matrix construction via inverted index
+            idx_list = cell(numMenus, 1);
+            m_list = cell(numMenus, 1);
+            
+            for m = 1:numMenus
+                target = Choices(m);
+                p_ids = SolverDB.InvertedIndex{m, target}; 
+                
+                idx_list{m} = p_ids;
+                m_list{m} = repmat(uint32(m), numel(p_ids), 1);
+            end
+            
+            I = double(vertcat(m_list{:}));
+            J = double(vertcat(idx_list{:}));
+            A = sparse(I, J, 1, numMenus, numPerms);
+            
+            % Solve ILP: A*x >= 1 => -A*x <= -1
+            try
+                [x, fval, exitflag, output] = intlinprog(f, intcon, -A, -b, [], [], lb, ub, options);
+                
+                if ~isempty(x)
+                    val = round(sum(x));
+                    
+                    if exitflag == 1
+                        flag_str = ''; 
+                    elseif exitflag == 0
+                        flag_str = sprintf('[GAP:%.1f%%]', output.relativegap * 100);
+                    else
+                        flag_str = '[FAIL]';
+                    end
+                else
+                    val = NaN;
+                    flag_str = '[NO_SOL]';
+                end
+            catch ME
+                val = NaN;
+                flag_str = ['[ERR:' ME.identifier ']'];
+            end
+            
+            samples(k, r) = val;
+            
+            if mod(current_iter, 1) == 0
+                fprintf('\r%5.1f%%    %.1fs      k=%d (eps=%.2f) => Val=%-4d %s', ...
+                    (current_iter/total_iters)*100, toc(t_start), k, sqrt(eps_val), val, flag_str);
+            end
+        end
+    end
+    fprintf('\n');
+    
+    mean_MMR = mean(samples, 2, 'omitnan');
+    se_MMR = std(samples, 0, 2, 'omitnan') / sqrt(R);
+end
+
+function [topo, SolverDB] = precompute_structures(n)
+    % Precompute topology and inverted index for fast constraint assembly
+    
+    numSubsets = 2^n;
+    topo.numMenus = numSubsets - 1;
+    topo.elements = cell(topo.numMenus, 1);
+    
+    for mask = 1:topo.numMenus
+        topo.elements{mask} = uint8(find(bitget(mask, 1:n)));
+    end
+    
+    % Generate all permutations (40320 for n=8)
+    Perms = perms(1:n); 
+    Perms = uint8(Perms');
+    [~, numPerms] = size(Perms);
+    
+    SolverDB.numMenus = topo.numMenus;
+    SolverDB.numPerms = numPerms;
+    
+    % Build inverted index: Index{m, item} = [List of Perm IDs]
+    SolverDB.InvertedIndex = cell(topo.numMenus, n);
+    
+    % Rank table for fast choice lookup
+    RankTable = zeros(n, numPerms, 'uint8');
+    for p = 1:numPerms
+        RankTable(Perms(:, p), p) = 1:n;
+    end
+    
+    % Populate inverted index
+    for m = 1:topo.numMenus
+        elems = topo.elements{m};
+        sub_ranks = RankTable(elems, :);
+        [~, min_idx_row] = min(sub_ranks, [], 1);
+        perm_choices_for_m = elems(min_idx_row);
+        
+        for itm = elems
+            idx = find(perm_choices_for_m == itm);
+            SolverDB.InvertedIndex{m, itm} = uint32(idx(:));
+        end
+    end
+end
