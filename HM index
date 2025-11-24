@@ -1,0 +1,182 @@
+function plot_HM_eps_n10_optimized()
+% Monte Carlo estimate of E[HM] for n=10
+% Architecture: Block-streaming parallel computation with minimal memory footprint
+
+    n = 10;
+    R = 200;
+    seed = 20251212;
+    BlockSize = 5000; % ~5MB per block, fits in L3 cache
+    
+    sqrt_eps_grid = (0:0.1:1).';
+    eps_grid = sqrt_eps_grid.^2;
+    
+    fprintf('Initializing topology (n=%d)...\n', n);
+    topo = precompute_topology_only(n);
+    
+    fprintf('Generating Monte Carlo samples...\n');
+    [DataMatrix, SampleMeta] = generate_all_samples(n, R, eps_grid, seed, topo);
+    
+    fprintf('Block-parallel computation (Search space: %d permutations)...\n', factorial(n));
+    
+    if isempty(gcp('nocreate')), parpool; end
+    
+    MaxConsistency = streaming_HM_solver(n, topo, DataMatrix, BlockSize);
+    
+    % HM = M - MaxConsistency
+    AllHM = double(topo.fullMask) - MaxConsistency;
+    
+    mean_HM = zeros(numel(eps_grid), 1);
+    se_HM = zeros(numel(eps_grid), 1);
+    
+    for k = 1:numel(eps_grid)
+        indices = find(SampleMeta.eps_idx == k);
+        hm_vals = AllHM(indices);
+        mean_HM(k) = mean(hm_vals);
+        if R > 1
+            se_HM(k) = std(hm_vals) / sqrt(R);
+        end
+    end
+
+    figure;
+    errorbar(sqrt_eps_grid, mean_HM, se_HM, 'o-', 'LineWidth', 1.5);
+    title(sprintf('High-Performance HPC Estimate (n=%d, R=%d)', n, R));
+    xlabel('$\sqrt{\varepsilon}$', 'Interpreter','latex');
+    ylabel('$E[\mathrm{HM}]$', 'Interpreter','latex');
+    grid on;
+    
+    fprintf('Done.\n');
+end
+
+function GlobalMaxScores = streaming_HM_solver(n, topo, DataMatrix, BlockSize)
+    % Core solver: streaming parallel processing with map-reduce pattern
+    
+    AllPerms = int8(perms(1:n)); 
+    numPerms = size(AllPerms, 1);
+    numBlocks = ceil(numPerms / BlockSize);
+    numSamples = size(DataMatrix, 2);
+    
+    fprintf('Parallel pool processing %d blocks...\n', numBlocks);
+    tic;
+    
+    starts = 1:BlockSize:numPerms;
+    ends = min(starts + BlockSize - 1, numPerms);
+    N_chunks = numel(starts);
+    
+    chunk_results = cell(N_chunks, 1);
+    
+    parfor i = 1:N_chunks
+        p_idx = starts(i):ends(i);
+        current_perms = AllPerms(p_idx, :);
+        
+        BlockChoices = generate_block_choices(current_perms, topo);
+        
+        local_max = zeros(1, numSamples);
+        
+        % Avoid 3D array explosion by looping over samples
+        for s = 1:numSamples
+            sample_vec = DataMatrix(:, s);
+            matches = (BlockChoices == sample_vec); 
+            scores = sum(matches, 1);
+            local_max(s) = max(scores);
+        end
+        
+        chunk_results{i} = local_max;
+    end
+    
+    % Reduce phase
+    fprintf('Reduce phase: merging %d chunks...\n', N_chunks);
+    GlobalMaxScores = zeros(1, numSamples);
+    for i = 1:N_chunks
+        GlobalMaxScores = max(GlobalMaxScores, chunk_results{i});
+    end
+    
+    toc;
+end
+
+function BlockChoices = generate_block_choices(perms_block, topo)
+    % Generate block choices on-the-fly (time-space tradeoff)
+    
+    [B, n] = size(perms_block);
+    M = topo.fullMask;
+    BlockChoices = zeros(M, B, 'uint8');
+    
+    % Convert permutations to priority matrix
+    Priority = zeros(B, n, 'uint8');
+    for k = 1:B
+        p = perms_block(k, :);
+        Priority(k, p) = 1:n; 
+    end
+    
+    elements_cell = topo.elements;
+    
+    for mask = 1:M
+        elems = elements_cell{mask+1};
+        if isempty(elems), continue; end
+        
+        sub_p = Priority(:, elems);
+        [~, min_local_idx] = min(sub_p, [], 2); 
+        
+        BlockChoices(mask, :) = elems(min_local_idx);
+    end
+end
+
+function topo = precompute_topology_only(n)
+    % Precompute topology structure without choice matrix
+    
+    numSubsets = 2^n;
+    fullMask = numSubsets - 1;
+    elements = cell(numSubsets, 1);
+    top_true = zeros(numSubsets, 1, 'uint8');
+
+    for mask = 1:fullMask
+        elems = uint8(find(bitget(mask, 1:n)));
+        elements{mask+1} = elems;
+        top_true(mask+1) = elems(1); % Top element under true ranking 1>2>...>n
+    end
+    
+    topo.n = n;
+    topo.fullMask = fullMask;
+    topo.elements = elements;
+    topo.top = top_true;
+    topo.numSubsets = numSubsets;
+end
+
+function [DataMatrix, SampleMeta] = generate_all_samples(n, R, eps_grid, seed, topo)
+    % Generate all Monte Carlo sample data upfront
+    
+    rng(seed);
+    fullMask = topo.fullMask;
+    numEps = numel(eps_grid);
+    
+    TotalSamples = R * numEps;
+    DataMatrix = zeros(fullMask, TotalSamples, 'uint8');
+    SampleMeta.eps_idx = zeros(TotalSamples, 1);
+    
+    col = 0;
+    for k = 1:numEps
+        eps_val = eps_grid(k);
+        for r = 1:R
+            col = col + 1;
+            
+            U = rand(fullMask, 1);
+            J = zeros(fullMask, 1, 'uint8');
+            for m = 1:fullMask
+                J(m) = uint8(randi(numel(topo.elements{m+1})));
+            end
+            
+            choice = zeros(fullMask, 1, 'uint8');
+            for m = 1:fullMask
+                elems = topo.elements{m+1};
+                topElem = topo.top(m+1);
+                if U(m) > eps_val
+                    choice(m) = topElem;
+                else
+                    choice(m) = elems(J(m));
+                end
+            end
+            
+            DataMatrix(:, col) = choice;
+            SampleMeta.eps_idx(col) = k;
+        end
+    end
+end
