@@ -1,0 +1,186 @@
+function plot_famulari_eps_main()
+% Monte Carlo estimation of E[F(c_ε)] as function of sqrt(ε)
+% Famulari index measures acyclicity violations in choice data
+
+    n    = 10;
+    R    = 1000;
+    seed = 20251212;
+
+    sqrt_eps_grid = (0:0.1:1).';
+    eps_grid      = sqrt_eps_grid.^2;
+
+    [eps_grid, mean_F, se_F] = simulate_famulari_vs_eps(n, R, eps_grid, seed);
+
+    sqrt_eps = sqrt(eps_grid);
+
+    figure('Color', 'w', 'Position', [100, 100, 700, 500]);
+    errorbar(sqrt_eps, mean_F, se_F, 'o-', ...
+             'LineWidth', 1.5, ...
+             'MarkerSize', 6, ...
+             'Color', [0, 0, 0], ...
+             'MarkerFaceColor', [0, 0, 0], ...
+             'CapSize', 8);
+
+    xlabel('$\sqrt{\varepsilon}$', 'Interpreter', 'latex', 'FontSize', 14);
+    ylabel('$E[F(c_{\varepsilon})]$', 'Interpreter', 'latex', 'FontSize', 14);
+    title(sprintf('Monte Carlo Estimation of $E[F(c_{\\varepsilon})]$ (n=%d, R=%d)', n, R), ...
+          'Interpreter', 'latex', 'FontSize', 12);
+
+    xlim([-0.02, 1.02]);
+    xticks(0:0.1:1);
+    grid on;
+    box on;
+    set(gca, 'TickLabelInterpreter', 'latex', 'FontSize', 12);
+
+    fprintf('\n=== Monte Carlo results ===\n');
+    fprintf('%-10s %-10s %-15s %-15s\n', 'epsilon', 'sqrt_eps', 'E[F(c_eps)]', 'Std Error');
+    fprintf('%-10s %-10s %-15s %-15s\n', '-------', '--------', '-----------', '---------');
+    for k = 1:numel(eps_grid)
+        fprintf('%-10.4f %-10.4f %-15.6f %-15.6f\n', ...
+                eps_grid(k), sqrt_eps(k), mean_F(k), se_F(k));
+    end
+    fprintf('===\n\n');
+end
+
+function [eps_grid, mean_F, se_F] = simulate_famulari_vs_eps(n, R, eps_grid, seed)
+% Monte Carlo simulation: estimate E[F(c_ε)] for each ε
+
+    if nargin < 4
+        seed = 12345;
+    end
+    rng(seed);
+
+    eps_grid = eps_grid(:);
+    K_eps    = numel(eps_grid);
+
+    fprintf('Precomputing structure for n=%d...\n', n);
+    pre = precompute_famulari_structure(n);
+
+    numSubsets = pre.numSubsets;
+    fullMask   = pre.fullMask;
+    elements   = pre.elements;
+    top        = pre.top;
+
+    samples = zeros(K_eps, R);
+
+    fprintf('running Monte Carlo simulation (R=%d, K_eps=%d)...\n', R, K_eps);
+    fprintf('Total iterations: %d\n', R * K_eps);
+    
+    tic;
+    for r = 1:R
+        % Common random numbers: same randomness across all ε
+        U = rand(fullMask, 1);
+        J = zeros(fullMask, 1, 'uint8');
+        for mask = 1:fullMask
+            k_elem  = numel(elements{mask+1});
+            J(mask) = uint8(randi(k_elem));
+        end
+
+        for k_eps = 1:K_eps
+            eps = eps_grid(k_eps);
+            eps = max(0, min(1, eps)); % Clamp to [0,1]
+
+            % Generate choice function c_ε
+            choice = zeros(numSubsets, 1, 'uint8');
+            for mask = 1:fullMask
+                elems   = elements{mask+1};
+                topElem = top(mask+1);
+                if U(mask) > eps
+                    ch = topElem; % Rational choice with prob 1-ε
+                else
+                    ch = elems(J(mask)); % Uniform random with prob ε
+                end
+                choice(mask+1) = ch;
+            end
+
+            F_val = compute_famulari_index(choice, pre);
+            samples(k_eps, r) = F_val;
+        end
+        
+        if mod(r, 100) == 0 || r == R
+            fprintf('  Progress: %d/%d (%.1f%%), Time: %.2fs\n', ...
+                    r, R, 100*r/R, toc);
+        end
+    end
+    fprintf('simulation complete. Total time: %.2fs\n\n', toc);
+
+    mean_F = mean(samples, 2);
+    if R > 1
+        std_F = std(samples, 0, 2);
+    else
+        std_F = zeros(K_eps, 1);
+    end
+    se_F = std_F / sqrt(R);
+end
+
+function pre = precompute_famulari_structure(n)
+% Precompute topology: bitmask to elements mapping and top choices
+
+    numSubsets = 2^n;
+    fullMask   = numSubsets - 1;
+
+    elements = cell(numSubsets, 1);
+    top      = zeros(numSubsets, 1, 'uint8');
+
+    for mask = 1:fullMask
+        elems = find(bitget(mask, 1:n));
+        elems_u8 = uint8(elems);
+        elements{mask+1} = elems_u8;
+        top(mask+1) = elems_u8(1); % Top element under ranking 1>2>...>n
+    end
+
+    pre.n          = n;
+    pre.numSubsets = numSubsets;
+    pre.fullMask   = fullMask;
+    pre.elements   = elements;
+    pre.top        = top;
+end
+
+function F_val = compute_famulari_index(choice, pre)
+% Compute Famulari index F(c) via revealed preference and transitive closure
+% F(c) = |{(x,y): x≠y, (x,y)∈T_c, (y,x)∈R_c}|
+
+    n          = pre.n;
+    fullMask   = pre.fullMask;
+    elements   = pre.elements;
+
+    % build direct revealed preference relation R_c
+    % R(x,y) = true iff ∃D: c(D)=x and y∈D\{x}
+    R = false(n, n);
+
+    for mask = 1:fullMask
+        chosen = choice(mask+1);
+        if chosen == 0
+            continue;
+        end
+        elems = elements{mask+1};
+        for idx = 1:numel(elems)
+            y = elems(idx);
+            if y ~= chosen
+                R(chosen, y) = true; % x ≻_c y
+            end
+        end
+    end
+
+    % compute transitive closure T_c via Warshall's algorithm
+    T = R;
+
+    for k = 1:n
+        for i = 1:n
+            if T(i, k)
+                T(i, :) = T(i, :) | T(k, :);
+            end
+        end
+    end
+
+    % Count Famulari violations
+    % F(c) = |{(x,y): x≠y, (x,y)∈T_c, (y,x)∈R_c}|
+    F_val = 0;
+    for x = 1:n
+        for y = 1:n
+            if x ~= y && T(x, y) && R(y, x)
+                F_val = F_val + 1;
+            end
+        end
+    end
+end
