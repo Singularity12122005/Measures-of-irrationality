@@ -1,0 +1,256 @@
+function plot_n_c_eps_main()
+% Monte Carlo estimation of E[n(c_ε)] as function of sqrt(ε)
+
+    n    = 10;
+    R    = 1000;
+    seed = 20251212;
+
+    sqrt_eps_grid = (0:0.1:1).';
+    eps_grid      = sqrt_eps_grid.^2;
+
+    [eps_grid, mean_n, se_n] = simulate_n_c_vs_eps(n, R, eps_grid, seed);
+
+    sqrt_eps = sqrt(eps_grid);
+
+    figure('Color', 'w', 'Position', [100, 100, 700, 500]);
+    errorbar(sqrt_eps, mean_n, se_n, 'o-', ...
+             'LineWidth', 1.5, ...
+             'MarkerSize', 6, ...
+             'Color', [0, 0, 0], ...
+             'MarkerFaceColor', [0, 0, 0], ...
+             'CapSize', 8);
+
+    xlabel('$\sqrt{\varepsilon}$', 'Interpreter', 'latex', 'FontSize', 14);
+    ylabel('$E[n(c_{\varepsilon})]$', 'Interpreter', 'latex', 'FontSize', 14);
+    title(sprintf('Monte Carlo Estimation of $E[n(c_{\\varepsilon})]$ (n=%d, R=%d)', n, R), ...
+          'Interpreter', 'latex', 'FontSize', 12);
+
+    xlim([-0.02, 1.02]);
+    xticks(0:0.1:1);
+    grid on;
+    box on;
+    set(gca, 'TickLabelInterpreter', 'latex', 'FontSize', 12);
+
+    fprintf('\n=== Monte Carlo Results ===\n');
+    fprintf('%-10s %-10s %-15s %-15s\n', 'epsilon', 'sqrt_eps', 'E[n(c_eps)]', 'Std Error');
+    fprintf('%-10s %-10s %-15s %-15s\n', '-------', '--------', '-----------', '---------');
+    for k = 1:numel(eps_grid)
+        fprintf('%-10.4f %-10.4f %-15.6f %-15.6f\n', ...
+                eps_grid(k), sqrt_eps(k), mean_n(k), se_n(k));
+    end
+    fprintf('===========================\n\n');
+end
+
+function [eps_grid, mean_n, se_n] = simulate_n_c_vs_eps(n, R, eps_grid, seed)
+% Monte Carlo simulation: estimate E[n(c_ε)] for each ε
+
+    if nargin < 4
+        seed = 12345;
+    end
+    rng(seed);
+
+    eps_grid = eps_grid(:);
+    K_eps    = numel(eps_grid);
+
+    fprintf('Precomputing structure for n=%d...\n', n);
+    pre = precompute_n_c_structure(n);
+
+    numSubsets = pre.numSubsets;
+    fullMask   = pre.fullMask;
+    elements   = pre.elements;
+    top        = pre.top;
+
+    samples = zeros(K_eps, R);
+
+    fprintf('Running Monte Carlo simulation (R=%d, K_eps=%d)...\n', R, K_eps);
+    fprintf('Total iterations: %d\n', R * K_eps);
+    
+    tic;
+    for r = 1:R
+        % Common random numbers: same randomness across all ε
+        U = rand(fullMask, 1);
+        J = zeros(fullMask, 1, 'uint8');
+        for mask = 1:fullMask
+            k_elem  = numel(elements{mask+1});
+            J(mask) = uint8(randi(k_elem));
+        end
+
+        for k_eps = 1:K_eps
+            eps = eps_grid(k_eps);
+            eps = max(0, min(1, eps)); % Clamp to [0,1]
+
+            % Generate choice function c_ε
+            choice = zeros(numSubsets, 1, 'uint8');
+            for mask = 1:fullMask
+                elems   = elements{mask+1};
+                topElem = top(mask+1);
+                if U(mask) > eps
+                    ch = topElem; % Rational choice with prob 1-ε
+                else
+                    ch = elems(J(mask)); % Uniform random with prob ε
+                end
+                choice(mask+1) = ch;
+            end
+
+            n_c = compute_n_c_given_choice(choice, pre);
+            samples(k_eps, r) = n_c;
+        end
+        
+        if mod(r, 100) == 0 || r == R
+            fprintf('  Progress: %d/%d (%.1f%%), Time: %.2fs\n', ...
+                    r, R, 100*r/R, toc);
+        end
+    end
+    fprintf('Simulation complete. Total time: %.2fs\n\n', toc);
+
+    mean_n = mean(samples, 2);
+    if R > 1
+        std_n = std(samples, 0, 2);
+    else
+        std_n = zeros(K_eps, 1);
+    end
+    se_n = std_n / sqrt(R);
+end
+
+function pre = precompute_n_c_structure(n)
+% Precompute topology, feasibility graph, and baseline
+
+    numSubsets = 2^n;
+    fullMask   = numSubsets - 1;
+    mask_vec   = uint32(0:fullMask);
+
+    % Popcount via bit manipulation
+    popcount = zeros(numSubsets, 1, 'uint8');
+    for mask = 1:fullMask
+        m = bitand(mask, mask-1);
+        popcount(mask+1) = popcount(m+1) + 1;
+    end
+
+    % Elements and top element for each menu
+    elements = cell(numSubsets, 1);
+    top      = zeros(numSubsets, 1, 'uint8');
+    for mask = 1:fullMask
+        elems = find(bitget(mask, 1:n));
+        elements{mask+1} = uint8(elems);
+        top(mask+1)      = uint8(elems(1));
+    end
+
+    % Build feasibility graph edges
+    edge_s    = [];
+    edge_t    = [];
+    edge_D    = [];
+    edge_x    = [];
+    edge_feas = [];
+
+    % Source edges: s -> {x}
+    for x = 1:n
+        singletonMask = bitshift(uint32(1), x-1);
+        edge_s(end+1, 1) = 1;
+        edge_t(end+1, 1) = double(singletonMask) + 1;
+        edge_D(end+1, 1) = double(singletonMask);
+        edge_x(end+1, 1) = x;
+        feas               = factorial(n-1);
+        edge_feas(end+1,1) = feas;
+    end
+
+    % Extension edges: D\{x} -> D for |D| >= 2
+    for Dmask = 1:fullMask
+        d = double(popcount(Dmask+1));
+        if d >= 2
+            elems = elements{Dmask+1};
+            feas  = factorial(n-d) * factorial(d-1);
+            for ei = 1:numel(elems)
+                x = double(elems(ei));
+                fromMask = bitset(Dmask, x, 0);
+                edge_s(end+1,1)    = double(fromMask) + 1;
+                edge_t(end+1,1)    = Dmask + 1;
+                edge_D(end+1,1)    = Dmask;
+                edge_x(end+1,1)    = x;
+                edge_feas(end+1,1) = feas;
+            end
+        end
+    end
+
+    pre.n          = n;
+    pre.numSubsets = numSubsets;
+    pre.fullMask   = fullMask;
+    pre.mask_vec   = mask_vec;
+    pre.popcount   = popcount;
+    pre.elements   = elements;
+    pre.top        = top;
+    pre.edge_s     = edge_s;
+    pre.edge_t     = edge_t;
+    pre.edge_D     = edge_D;
+    pre.edge_x     = edge_x;
+    pre.edge_feas  = edge_feas;
+
+    % Compute baseline: rational choice gives n(c_rational) as reference
+    choice_rational = zeros(numSubsets, 1, 'uint8');
+    for mask = 1:fullMask
+        choice_rational(mask+1) = top(mask+1);
+    end
+    n_raw_rational  = compute_n_raw_given_choice(choice_rational, pre);
+    pre.baseline    = n_raw_rational;
+    fprintf('  Baseline n(c_rational) = %.0f\n', n_raw_rational);
+end
+
+function n_raw = compute_n_raw_given_choice(choice, pre)
+% Compute raw n(c) = n! - maxflow via capacity-constrained graph
+
+    n          = pre.n;
+    numSubsets = pre.numSubsets;
+
+    K_all = compute_K_all(choice, pre);
+
+    % Extract K(D,x) for each edge
+    idx_edges = sub2ind([numSubsets, n], pre.edge_D + 1, pre.edge_x);
+    K_edges   = K_all(idx_edges);
+
+    % Edge capacity: feas(D,x) - max(K(D,x), 0)
+    cap = pre.edge_feas - max(K_edges, 0);
+    cap(cap < 0) = 0;
+
+    % Max flow from source (index 1) to sink (fullMask+1)
+    G = digraph(pre.edge_s, pre.edge_t, cap, numSubsets);
+    maxFlow = maxflow(G, 1, pre.fullMask + 1);
+
+    n_raw = factorial(n) - maxFlow;
+end
+
+function n_c = compute_n_c_given_choice(choice, pre)
+% Compute baseline-adjusted n(c) ensuring non-negativity
+
+    n_raw = compute_n_raw_given_choice(choice, pre);
+    n_c   = n_raw - pre.baseline;
+    if n_c < 0
+        n_c = 0;
+    end
+end
+
+function K_all = compute_K_all(choice, pre)
+% Compute K(D,x) via superset möbius transform
+% For each x: f_x(S) = 1{c(S)=x}
+%             K(D,x) = Σ_{E⊇D} (-1)^{|E\D|} f_x(E)
+
+    n          = pre.n;
+    numSubsets = pre.numSubsets;
+    mask_vec   = pre.mask_vec;
+
+    K_all = zeros(numSubsets, n);
+
+    for x = 1:n
+        f = double(choice == x);
+        g = f;
+
+        % Superset Möbius transform: iteratively subtract supersets
+        for i = 1:n
+            bit = bitshift(uint32(1), i-1);
+            mask_no_bit = mask_vec(bitand(mask_vec, bit) == 0);
+            idx_no_bit  = double(mask_no_bit)     + 1;
+            idx_with    = double(mask_no_bit+bit) + 1;
+            g(idx_no_bit) = g(idx_no_bit) - g(idx_with);
+        end
+
+        K_all(:, x) = g;
+    end
+end
