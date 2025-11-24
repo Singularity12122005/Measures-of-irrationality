@@ -1,0 +1,524 @@
+function plot_four_measures_unified()
+    n    = 7;
+    R    = 500;
+    seed = 20251212;
+    eps_grid = (0:0.1:1).';
+
+    fprintf('========================================\n');
+    fprintf('Unified Four Rationality Measures\n');
+    fprintf('n=%d, R=%d, ε ∈ [0, 1]\n', n, R);
+    fprintf('========================================\n\n');
+
+    fprintf('>>> Pre-generating random numbers...\n');
+    [all_U, all_J] = pregenerate_random_numbers(n, R, seed);
+
+    fprintf('\n>>> Computing HM...\n');
+    tic;
+    [mean_HM, se_HM] = compute_HM_measure(n, R, eps_grid, all_U, all_J);
+    fprintf('    HM time: %.2f seconds\n', toc);
+
+    fprintf('\n>>> Computing MMR...\n');
+    tic;
+    [mean_MMR, se_MMR] = compute_MMR_measure(n, R, eps_grid, all_U, all_J);
+    fprintf('    MMR time: %.2f seconds\n', toc);
+
+    fprintf('\n>>> Computing n(c)...\n');
+    tic;
+    [mean_nc, se_nc] = compute_nc_measure(n, R, eps_grid, all_U, all_J);
+    fprintf('    n(c) time: %.2f seconds\n', toc);
+
+    fprintf('\n>>> Computing F(c)...\n');
+    tic;
+    [mean_F, se_F] = compute_Famulari_measure(n, R, eps_grid, all_U, all_J);
+    fprintf('    F(c) time: %.2f seconds\n', toc);
+
+    fig = figure('Color', 'w', 'Position', [100, 100, 1000, 700]);
+    hold on;
+
+    color_HM  = [0.85, 0.15, 0.15];
+    color_MMR = [0.15, 0.40, 0.85];
+    color_nc  = [0.15, 0.65, 0.25];
+    color_F   = [0.65, 0.15, 0.70];
+
+    h1 = plot(eps_grid, mean_HM, 'o-', 'LineWidth', 2.5, 'MarkerSize', 9, ...
+              'Color', color_HM, 'MarkerFaceColor', color_HM, 'DisplayName', 'HM');
+    h2 = plot(eps_grid, mean_MMR, 's-', 'LineWidth', 2.5, 'MarkerSize', 9, ...
+              'Color', color_MMR, 'MarkerFaceColor', color_MMR, 'DisplayName', 'MMR');
+    h3 = plot(eps_grid, mean_nc, '^-', 'LineWidth', 2.5, 'MarkerSize', 9, ...
+              'Color', color_nc, 'MarkerFaceColor', color_nc, 'DisplayName', 'n(c)');
+    h4 = plot(eps_grid, mean_F, 'd-', 'LineWidth', 2.5, 'MarkerSize', 9, ...
+              'Color', color_F, 'MarkerFaceColor', color_F, 'DisplayName', 'F(c)');
+    hold off;
+
+    xlabel('$\varepsilon$', 'Interpreter', 'latex', 'FontSize', 20);
+    ylabel('Measure Value', 'Interpreter', 'latex', 'FontSize', 20);
+    legend([h1, h2, h3, h4], 'Location', 'northwest', 'Interpreter', 'latex', ...
+           'FontSize', 14, 'Box', 'on');
+
+    grid on; box on;
+    xlim([-0.02, 1.02]);
+    xticks(0:0.1:1);
+    set(gca, 'TickLabelInterpreter', 'latex', 'FontSize', 15);
+    
+    all_data = [mean_HM; mean_MMR; mean_nc; mean_F];
+    y_min = min(all_data);
+    y_max = max(all_data);
+    ylim([y_min * 0.95, y_max * 1.05]);
+
+    fprintf('\n=== SUMMARY TABLE ===\n');
+    fprintf('%-12s %-18s %-18s %-20s %-18s\n', 'ε', 'E[HM]±SE', 'E[MMR]±SE', 'E[n(c)]±SE', 'E[F(c)]±SE');
+    fprintf('%-12s %-18s %-18s %-20s %-18s\n', '----------', '----------------', '----------------', '------------------', '----------------');
+    for k = 1:numel(eps_grid)
+        fprintf('%-12.2f %-18s %-18s %-20s %-18s\n', eps_grid(k), ...
+                sprintf('%.3f ± %.3f', mean_HM(k), se_HM(k)), ...
+                sprintf('%.2f ± %.2f', mean_MMR(k), se_MMR(k)), ...
+                sprintf('%.1f ± %.1f', mean_nc(k), se_nc(k)), ...
+                sprintf('%.2f ± %.2f', mean_F(k), se_F(k)));
+    end
+    fprintf('=====================\n\n');
+
+    fprintf('>>> Exporting data to CSV...\n');
+    output_table = table(eps_grid, mean_HM, se_HM, mean_MMR, se_MMR, mean_nc, se_nc, mean_F, se_F, ...
+                         'VariableNames', {'epsilon', 'mean_HM', 'se_HM', 'mean_MMR', 'se_MMR', ...
+                         'mean_nc', 'se_nc', 'mean_F', 'se_F'});
+    writetable(output_table, 'four_measures_results.csv');
+    fprintf('    Data exported to: four_measures_results.csv\n');
+end
+
+function [all_U, all_J] = pregenerate_random_numbers(n, R, seed)
+    rng(seed);
+    fullMask = 2^n - 1;
+    
+    fprintf('  Generating U matrix (%d x %d)...\n', fullMask, R);
+    all_U = rand(fullMask, R);
+    
+    fprintf('  Generating J matrix (%d x %d)...\n', fullMask, R);
+    all_J = cell(fullMask, R);
+    
+    elements_cache = cell(fullMask, 1);
+    for mask = 1:fullMask
+        elements_cache{mask} = uint8(find(bitget(mask, 1:n)));
+    end
+    
+    for r = 1:R
+        for m = 1:fullMask
+            k_elem = numel(elements_cache{m});
+            all_J{m, r} = uint8(randi(k_elem));
+        end
+    end
+    
+    fprintf('  Complete.\n');
+end
+
+function [mean_HM, se_HM] = compute_HM_measure(n, R, eps_grid, all_U, all_J)
+    K_eps = numel(eps_grid);
+    fullMask = 2^n - 1;
+    
+    fprintf('  Precomputing topology...\n');
+    topo = precompute_topology_HM(n);
+    
+    fprintf('  Generating all permutations (n!=%d)...\n', factorial(n));
+    AllPerms = int8(perms(1:n));
+    numPerms = size(AllPerms, 1);
+    
+    fprintf('  Precomputing permutation choices...\n');
+    PermChoices = zeros(fullMask, numPerms, 'uint8');
+    for p = 1:numPerms
+        PermChoices(:, p) = compute_perm_choice(AllPerms(p,:), topo);
+    end
+    
+    samples = zeros(K_eps, R);
+    
+    fprintf('  Running simulation...\n');
+    for r = 1:R
+        U = all_U(:, r);
+        J_col = all_J(:, r);
+        
+        for k = 1:K_eps
+            eps_val = eps_grid(k);
+            choice = zeros(fullMask, 1, 'uint8');
+            for m = 1:fullMask
+                elems = topo.elements{m+1};
+                if U(m) > eps_val
+                    choice(m) = topo.top(m+1);
+                else
+                    choice(m) = elems(J_col{m});
+                end
+            end
+            
+            matches = bsxfun(@eq, PermChoices, choice);
+            consistency = sum(matches, 1);
+            max_consistent = max(consistency);
+            HM_val = fullMask - max_consistent;
+            samples(k, r) = HM_val;
+        end
+        
+        if mod(r, 50) == 0 || r == R
+            fprintf('    Progress: %d/%d\n', r, R);
+        end
+    end
+    
+    mean_HM = mean(samples, 2);
+    se_HM = std(samples, 0, 2) / sqrt(R);
+end
+
+function topo = precompute_topology_HM(n)
+    fullMask = 2^n - 1;
+    elements = cell(fullMask+1, 1);
+    top = zeros(fullMask+1, 1, 'uint8');
+    
+    for mask = 1:fullMask
+        elems = uint8(find(bitget(mask, 1:n)));
+        elements{mask+1} = elems;
+        top(mask+1) = elems(1);
+    end
+    
+    topo.n = n;
+    topo.fullMask = fullMask;
+    topo.elements = elements;
+    topo.top = top;
+end
+
+function perm_choice = compute_perm_choice(perm, topo)
+    n = topo.n;
+    fullMask = topo.fullMask;
+    priority = zeros(1, n, 'uint8');
+    priority(perm) = 1:n;
+    
+    perm_choice = zeros(fullMask, 1, 'uint8');
+    for m = 1:fullMask
+        elems = topo.elements{m+1};
+        [~, idx] = min(priority(elems));
+        perm_choice(m) = elems(idx);
+    end
+end
+
+function [mean_MMR, se_MMR] = compute_MMR_measure(n, R, eps_grid, all_U, all_J)
+    K_eps = numel(eps_grid);
+    
+    fprintf('  Precomputing MMR structures...\n');
+    [topo, SolverDB] = precompute_structures_MMR(n);
+    
+    samples = zeros(K_eps, R);
+    
+    options = optimoptions('intlinprog', 'Display', 'off', ...
+                           'IntegerTolerance', 1e-6, ...
+                           'RelativeGapTolerance', 0.0, ...
+                           'MaxTime', 60);
+    
+    f = ones(SolverDB.numPerms, 1);
+    intcon = 1:SolverDB.numPerms;
+    lb = zeros(SolverDB.numPerms, 1);
+    ub = ones(SolverDB.numPerms, 1);
+    b = ones(topo.numMenus, 1);
+    
+    fprintf('  Running ILP simulation...\n');
+    for r = 1:R
+        U = all_U(:, r);
+        J_col = all_J(:, r);
+        
+        for k = 1:K_eps
+            eps_val = eps_grid(k);
+            
+            Choices = zeros(topo.numMenus, 1, 'uint8');
+            for m = 1:topo.numMenus
+                elems = topo.elements{m};
+                if U(m) > eps_val
+                    Choices(m) = elems(1);
+                else
+                    Choices(m) = elems(J_col{m});
+                end
+            end
+            
+            idx_list = cell(topo.numMenus, 1);
+            m_list = cell(topo.numMenus, 1);
+            
+            for m = 1:topo.numMenus
+                target = Choices(m);
+                p_ids = SolverDB.InvertedIndex{m, target};
+                idx_list{m} = p_ids;
+                m_list{m} = repmat(uint32(m), numel(p_ids), 1);
+            end
+            
+            I = double(vertcat(m_list{:}));
+            J = double(vertcat(idx_list{:}));
+            A = sparse(I, J, 1, topo.numMenus, SolverDB.numPerms);
+            
+            try
+                [x, ~, exitflag] = intlinprog(f, intcon, -A, -b, [], [], lb, ub, options);
+                if ~isempty(x) && exitflag == 1
+                    samples(k, r) = round(sum(x));
+                else
+                    samples(k, r) = NaN;
+                end
+            catch
+                samples(k, r) = NaN;
+            end
+        end
+        
+        if mod(r, 20) == 0 || r == R
+            fprintf('    Progress: %d/%d\n', r, R);
+        end
+    end
+    
+    mean_MMR = mean(samples, 2, 'omitnan');
+    se_MMR = std(samples, 0, 2, 'omitnan') / sqrt(R);
+end
+
+function [topo, SolverDB] = precompute_structures_MMR(n)
+    numSubsets = 2^n;
+    topo.numMenus = numSubsets - 1;
+    topo.elements = cell(topo.numMenus, 1);
+    
+    for mask = 1:topo.numMenus
+        topo.elements{mask} = uint8(find(bitget(mask, 1:n)));
+    end
+    
+    Perms = uint8(perms(1:n)');
+    [~, numPerms] = size(Perms);
+    
+    SolverDB.numPerms = numPerms;
+    SolverDB.InvertedIndex = cell(topo.numMenus, n);
+    
+    RankTable = zeros(n, numPerms, 'uint8');
+    for p = 1:numPerms
+        RankTable(Perms(:, p), p) = 1:n;
+    end
+    
+    for m = 1:topo.numMenus
+        elems = topo.elements{m};
+        sub_ranks = RankTable(elems, :);
+        [~, min_idx_row] = min(sub_ranks, [], 1);
+        perm_choices = elems(min_idx_row);
+        
+        for itm = elems
+            idx = find(perm_choices == itm);
+            SolverDB.InvertedIndex{m, itm} = uint32(idx(:));
+        end
+    end
+end
+
+function [mean_nc, se_nc] = compute_nc_measure(n, R, eps_grid, all_U, all_J)
+    K_eps = numel(eps_grid);
+    
+    fprintf('  Precomputing n(c) structure...\n');
+    pre = precompute_nc_structure(n);
+    
+    samples = zeros(K_eps, R);
+    
+    fprintf('  Running simulation...\n');
+    for r = 1:R
+        U = all_U(:, r);
+        J_col = all_J(:, r);
+        
+        for k = 1:K_eps
+            eps_val = eps_grid(k);
+            choice = zeros(pre.numSubsets, 1, 'uint8');
+            for m = 1:pre.fullMask
+                elems = pre.elements{m+1};
+                if U(m) > eps_val
+                    choice(m+1) = pre.top(m+1);
+                else
+                    choice(m+1) = elems(J_col{m});
+                end
+            end
+            
+            n_c = compute_n_c_given_choice(choice, pre);
+            samples(k, r) = n_c;
+        end
+        
+        if mod(r, 50) == 0 || r == R
+            fprintf('    Progress: %d/%d\n', r, R);
+        end
+    end
+    
+    mean_nc = mean(samples, 2);
+    se_nc = std(samples, 0, 2) / sqrt(R);
+end
+
+function pre = precompute_nc_structure(n)
+    numSubsets = 2^n;
+    fullMask = numSubsets - 1;
+    
+    popcount = zeros(numSubsets, 1, 'uint8');
+    for mask = 1:fullMask
+        m = bitand(mask, mask-1);
+        popcount(mask+1) = popcount(m+1) + 1;
+    end
+    
+    elements = cell(numSubsets, 1);
+    top = zeros(numSubsets, 1, 'uint8');
+    for mask = 1:fullMask
+        elems = uint8(find(bitget(mask, 1:n)));
+        elements{mask+1} = elems;
+        top(mask+1) = elems(1);
+    end
+    
+    [edge_s, edge_t, edge_D, edge_x, edge_feas] = build_feasibility_graph(n, numSubsets, popcount, elements);
+    
+    pre.n = n; pre.numSubsets = numSubsets; pre.fullMask = fullMask;
+    pre.mask_vec = uint32(0:fullMask); pre.popcount = popcount;
+    pre.elements = elements; pre.top = top;
+    pre.edge_s = edge_s; pre.edge_t = edge_t; pre.edge_D = edge_D;
+    pre.edge_x = edge_x; pre.edge_feas = edge_feas;
+    
+    choice_rational = zeros(numSubsets, 1, 'uint8');
+    for mask = 1:fullMask
+        choice_rational(mask+1) = top(mask+1);
+    end
+    pre.baseline = compute_n_raw_given_choice(choice_rational, pre);
+end
+
+function [edge_s, edge_t, edge_D, edge_x, edge_feas] = build_feasibility_graph(n, numSubsets, popcount, elements)
+    edge_s = []; edge_t = []; edge_D = []; edge_x = []; edge_feas = [];
+    
+    for x = 1:n
+        singletonMask = bitshift(uint32(1), x-1);
+        edge_s(end+1, 1) = 1;
+        edge_t(end+1, 1) = double(singletonMask) + 1;
+        edge_D(end+1, 1) = double(singletonMask);
+        edge_x(end+1, 1) = x;
+        edge_feas(end+1, 1) = factorial(n-1);
+    end
+    
+    for Dmask = 1:(numSubsets-1)
+        d = double(popcount(Dmask+1));
+        if d >= 2
+            elems = elements{Dmask+1};
+            feas = factorial(n-d) * factorial(d-1);
+            for ei = 1:numel(elems)
+                x = double(elems(ei));
+                fromMask = bitset(Dmask, x, 0);
+                edge_s(end+1, 1) = double(fromMask) + 1;
+                edge_t(end+1, 1) = Dmask + 1;
+                edge_D(end+1, 1) = Dmask;
+                edge_x(end+1, 1) = x;
+                edge_feas(end+1, 1) = feas;
+            end
+        end
+    end
+end
+
+function n_c = compute_n_c_given_choice(choice, pre)
+    n_raw = compute_n_raw_given_choice(choice, pre);
+    n_c = max(0, n_raw - pre.baseline);
+end
+
+function n_raw = compute_n_raw_given_choice(choice, pre)
+    K_all = compute_K_all(choice, pre);
+    idx_edges = sub2ind([pre.numSubsets, pre.n], pre.edge_D + 1, pre.edge_x);
+    K_edges = K_all(idx_edges);
+    cap = max(0, pre.edge_feas - max(K_edges, 0));
+    
+    G = digraph(pre.edge_s, pre.edge_t, cap, pre.numSubsets);
+    maxFlow = maxflow(G, 1, pre.fullMask + 1);
+    n_raw = factorial(pre.n) - maxFlow;
+end
+
+function K_all = compute_K_all(choice, pre)
+    K_all = zeros(pre.numSubsets, pre.n);
+    
+    for x = 1:pre.n
+        f = double(choice == x);
+        g = f;
+        for i = 1:pre.n
+            bit = bitshift(uint32(1), i-1);
+            mask_no_bit = pre.mask_vec(bitand(pre.mask_vec, bit) == 0);
+            idx_no_bit = double(mask_no_bit) + 1;
+            idx_with = double(mask_no_bit + bit) + 1;
+            g(idx_no_bit) = g(idx_no_bit) - g(idx_with);
+        end
+        K_all(:, x) = g;
+    end
+end
+
+function [mean_F, se_F] = compute_Famulari_measure(n, R, eps_grid, all_U, all_J)
+    K_eps = numel(eps_grid);
+    
+    fprintf('  Precomputing Famulari structure...\n');
+    pre = precompute_famulari_structure(n);
+    
+    samples = zeros(K_eps, R);
+    
+    fprintf('  Running simulation...\n');
+    for r = 1:R
+        U = all_U(:, r);
+        J_col = all_J(:, r);
+        
+        for k = 1:K_eps
+            eps_val = eps_grid(k);
+            choice = zeros(pre.numSubsets, 1, 'uint8');
+            for m = 1:pre.fullMask
+                elems = pre.elements{m+1};
+                if U(m) > eps_val
+                    choice(m+1) = pre.top(m+1);
+                else
+                    choice(m+1) = elems(J_col{m});
+                end
+            end
+            
+            F_val = compute_famulari_index(choice, pre);
+            samples(k, r) = F_val;
+        end
+        
+        if mod(r, 50) == 0 || r == R
+            fprintf('    Progress: %d/%d\n', r, R);
+        end
+    end
+    
+    mean_F = mean(samples, 2);
+    se_F = std(samples, 0, 2) / sqrt(R);
+end
+
+function pre = precompute_famulari_structure(n)
+    numSubsets = 2^n;
+    fullMask = numSubsets - 1;
+    elements = cell(numSubsets, 1);
+    top = zeros(numSubsets, 1, 'uint8');
+    
+    for mask = 1:fullMask
+        elems = uint8(find(bitget(mask, 1:n)));
+        elements{mask+1} = elems;
+        top(mask+1) = elems(1);
+    end
+    
+    pre.n = n; pre.numSubsets = numSubsets;
+    pre.fullMask = fullMask; pre.elements = elements; pre.top = top;
+end
+
+function F_val = compute_famulari_index(choice, pre)
+    n = pre.n;
+    R = false(n, n);
+    
+    for mask = 1:pre.fullMask
+        chosen = choice(mask+1);
+        if chosen == 0, continue; end
+        elems = pre.elements{mask+1};
+        for idx = 1:numel(elems)
+            y = elems(idx);
+            if y ~= chosen
+                R(chosen, y) = true;
+            end
+        end
+    end
+    
+    T = R;
+    for k = 1:n
+        for i = 1:n
+            if T(i, k)
+                T(i, :) = T(i, :) | T(k, :);
+            end
+        end
+    end
+    
+    F_val = 0;
+    for x = 1:n
+        for y = 1:n
+            if x ~= y && T(x, y) && R(y, x)
+                F_val = F_val + 1;
+            end
+        end
+    end
+end
+
+
